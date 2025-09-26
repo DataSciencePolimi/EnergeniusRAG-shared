@@ -1,0 +1,9 @@
+"""Module for managing graph parameters."""
+GRAPH_PARAMETER = {
+    "SIMILARITY_THRESHOLD": 0.6,
+    "TOP_ENTITIES": 12,
+    "TOP_CHUNKS": 5,
+    "TOP_COMMUNITIES": 3,
+    "TOP_OUTGOING_RELATIONSHIPS": 10,
+    "TOP_INCOMING_RELATIONSHIPS": 10
+}
