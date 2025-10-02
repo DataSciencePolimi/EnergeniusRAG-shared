@@ -58,6 +58,7 @@ Right now, test locally with [Ollama](https://ollama.com/)
 
 Models tried:
 
+-   gpt-oss
 -   llama3.2
 -   mistral
 
@@ -69,7 +70,7 @@ Embeddings:
 In order to run Ollama, launch the Ollama server in a separate terminal:
 
 ```shell
-ollama run llama3.2 # or mistral
+ollama run gpt-oss #llama3.2 or mistral
 ```
 
 ## UI
