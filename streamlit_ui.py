@@ -142,10 +142,26 @@ if prompt := st.chat_input("Enter your query"):
     st.chat_message("user").markdown(prompt)
 
     # Display waiting message
-    with st.spinner("Thinking..."):
-        # Calling the orchestrator to get the response
-        agent = orchestrator.user_message(prompt)
+    #with st.spinner("Thinking..."):
+    #    # Calling the orchestrator to get the response
+    #    agent = orchestrator.user_message(prompt)
+    #
+    #    # Store and display the response
+    #    st.session_state["messages"].append({"role": "assistant", "content": agent})
+    #    st.chat_message("assistant").markdown(agent)
 
-        # Store and display the response
-        st.session_state["messages"].append({"role": "assistant", "content": agent})
-        st.chat_message("assistant").markdown(agent)
+    # Streaming: create an empty placeholder for assistant message
+    with st.chat_message("assistant"):
+        response_placeholder = st.empty()
+        full_response = ""
+
+        # Show spinner while streaming response
+        with st.spinner(""):
+            for chunk in orchestrator.user_message(prompt):
+                full_response += chunk
+                response_placeholder.markdown(full_response)# + "▌")  # Show typing cursor
+
+        response_placeholder.markdown(full_response)  # Final cleanup
+
+        # Save final assistant message to history
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
