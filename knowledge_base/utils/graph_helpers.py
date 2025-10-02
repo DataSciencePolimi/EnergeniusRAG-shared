@@ -5,14 +5,40 @@ import numpy as np
 from rdflib import Graph
 from rdflib.plugins.sparql import prepareQuery
 
+import re
+import unicodedata
+
+def remove_accents(text):
+    # Normalize and strip accents
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', text)
+        if unicodedata.category(c) != 'Mn'
+    )
+
+def split_camel_case(text):
+    # Remove accents first
+    text = remove_accents(text)
+
+    # If the text is all uppercase (with optional underscores), leave it as is
+    if re.fullmatch(r'[A-Z_]+', text):
+        return text
+    
+    # Step 1: Add space before capital letters that follow lowercase letters (camelCase → camel Case)
+    text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', text)
+    
+    # Step 2: Add space before capital letters that are followed by lowercase letters (e.g., HTMLContent → HTML Content)
+    text = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', text)
+
+    return text
 
 def process_name_or_relationship(text: str) -> str:
     """Process a string to make it more readable.
     Args:
         text (str): The string to process.
     """
+    text = split_camel_case(text)
     text = text.replace("_", " ")
-    text = text.title()
+    text = text.lower()
     return text
 
 
