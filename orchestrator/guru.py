@@ -57,7 +57,7 @@ class Guru:
         """
         self.llm.load_messages(messages)
 
-    def user_message(self, message: str) -> str:
+    def user_message(self, message: str):# -> str:
         """
         Process a user message and return a response.
         Args:
@@ -66,9 +66,11 @@ class Guru:
             str: The response from the LLM.
         """
         if self.user_knowledge:
-            return self.llm.generate_response(self.know_base.user_message(message, self.user_type, self.house_type, self.region), message, False)
+            #return self.llm.generate_response(self.know_base.user_message(message, self.user_type, self.house_type, self.region), message, False)
+            yield from self.llm.generate_response_stream(self.know_base.user_message(message, self.user_type, self.house_type, self.region), message, False)
         else:
-            return self.llm.generate_response(None, message)
+            #return self.llm.generate_response(None, message)
+            yield from self.llm.generate_response_stream(None, message)
         
     def set_language(self, language: str) -> None:
         self.llm.set_language(language)

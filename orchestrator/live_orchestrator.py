@@ -49,8 +49,9 @@ class LiveOrchestrator(AbstractOrchestrator):
 
         self.guru.load_past_messages(typed_list)
 
-    def user_message(self, message: str) -> str:
+    def user_message(self, message: str):# -> str:
         """
         Process a user message and return a response.
         """
-        return self.guru.user_message(message)
+        #return self.guru.user_message(message)
+        yield from self.guru.user_message(message)
