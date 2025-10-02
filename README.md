@@ -80,3 +80,19 @@ To run the UI
 ```shell
 streamlit run streamlit_ui.py
 ```
+
+# Citation
+
+```
+@article{Campi_Giudici_Pinciroli_Vago_Brambilla_Fraternali_2025,
+    title={Enhancing Human-AI Collaboration through a Conversational Agent for Energy Efficiency},
+    author={Campi, Riccardo and Giudici, Mathyas and Pinciroli Vago, Nicolò Oreste and Brambilla, Marco and Fraternali, Piero},
+    journal={Proceedings of the AAAI Symposium Series},
+    volume={5},
+    number={1},
+    pages={52-55},
+    year={2025},
+    month={May},
+    DOI={10.1609/aaaiss.v5i1.35554}
+}
+```
