@@ -165,3 +165,51 @@ class LLMHandler:
             self.messages.append(response)
 
         return response.content
+
+    def generate_response_stream(
+        self, system_prompt: str, user_message: str, use_past_history: bool = True
+    ):# -> str:
+        """
+        Generate a response from the LLM model based on the provided prompt.
+
+        Args:
+            prompt (str): The input prompt for the LLM model.
+
+        Returns:
+            str: The generated response from the LLM model.
+        """
+        # Check if the system prompt is None
+        if system_prompt is None:
+            system_prompt = self.get_default_system_prompt().content
+
+        # Creation of the messages
+        if use_past_history:
+            # if the user wants to use the past history
+            messages = self.messages.copy()
+        else:
+            messages = [SystemMessage(content=system_prompt)]
+
+        user_message = HumanMessage(content=user_message)
+        messages.append(user_message)
+
+        # Generation of the response
+        #response: AIMessage = self.model.invoke(messages)
+
+        # Streaming: assume model has been initialized with streaming=True
+        full_response = ""
+        streamed_response = self.model.stream(messages)
+        for chunk in streamed_response:
+            if hasattr(chunk, "content"):
+                token = chunk.content
+            else:
+                token = str(chunk)  # fallback, just in case
+
+            full_response += token
+            yield token  # stream each token
+
+        # Check if messages should be kept
+        if self.keep_history:
+            self.messages.append(user_message)
+            self.messages.append(full_response)
+
+        #return response.content
