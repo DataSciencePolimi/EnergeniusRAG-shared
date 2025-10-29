@@ -54,4 +54,4 @@ class LiveOrchestrator(AbstractOrchestrator):
         Process a user message and return a response.
         """
         #return self.guru.user_message(message)
-        yield from self.guru.user_message(message)
+        yield from self.guru.user_message_stream(message)

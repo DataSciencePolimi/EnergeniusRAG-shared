@@ -16,9 +16,10 @@ class Guru:
     user_type: str
     house_type: str
     region: str
+    language: str
 
     def __init__(self, provider: str, model: str, embedding: str, language: str,
-                 temperature: float, user_type: str = None, house_type: str = None, region: str = None, use_knowledge: bool = True) -> None:
+                 temperature: float, region: str, user_type: str = None, house_type: str = None, use_knowledge: bool = True) -> None:
         """Initialize the Guru class.
 
         Args:
@@ -42,7 +43,8 @@ class Guru:
             provider=provider,
             model=model,
             embedding=embedding,
-            language=language
+            language=language,
+            knowledge_base_path=f"files_{region}"
         )
         self.user_knowledge = use_knowledge
         self.user_type = user_type
@@ -66,12 +68,31 @@ class Guru:
             str: The response from the LLM.
         """
         if self.user_knowledge:
-            #return self.llm.generate_response(self.know_base.user_message(message, self.user_type, self.house_type, self.region), message, False)
+            return self.llm.generate_response(self.know_base.user_message(message, self.user_type, self.house_type, self.region), message, False)
+        else:
+            return self.llm.generate_response(None, message)
+
+    def user_message_stream(self, message: str):# -> str:
+        """
+        Process a user message and return a response.
+        Args:
+            message (str): The user message to process.
+        Returns:
+            str: The response from the LLM.
+        """
+        if self.user_knowledge:
             yield from self.llm.generate_response_stream(self.know_base.user_message(message, self.user_type, self.house_type, self.region), message, False)
         else:
-            #return self.llm.generate_response(None, message)
             yield from self.llm.generate_response_stream(None, message)
         
     def set_language(self, language: str) -> None:
+        self.know_base.language = language
         self.llm.set_language(language)
+        
+    def set_region(self, region: str) -> None:
+        self.region = region
+        self.know_base.knowledge_base_path = f"files_{region}"
+        
+    def set_temperature(self, temperature: float) -> None:
+        self.temperature = temperature
         
