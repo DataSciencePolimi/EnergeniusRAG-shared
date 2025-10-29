@@ -1,7 +1,6 @@
 """Module for managing graph parameters."""
 GRAPH_PARAMETER = {
-    "TOP_ENTITIES": 10,
-    "TOP_MERGED_ENTITIES": 15,
+    "TOP_ENTITIES": 5,
 	"ENTITIES_DISTANCE_THRESHOLD": 0.5,
     "TOP_TRIPLES": 10,
     "TOP_MERGED_TRIPLES": 15,

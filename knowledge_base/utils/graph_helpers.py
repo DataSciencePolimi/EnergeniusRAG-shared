@@ -4,6 +4,7 @@ import numpy as np
 
 from rdflib import Graph
 from rdflib.plugins.sparql import prepareQuery
+from nltk.corpus import wordnet as wn
 
 import re
 import unicodedata
@@ -18,18 +19,27 @@ def remove_accents(text):
 def split_camel_case(text):
     # Remove accents first
     text = remove_accents(text)
+    
+    # Remove genitivo sassone
+    text = text.replace("'s", "").replace("'S", "").replace("s'", "s").replace("S'", "S")
 
     # If the text is all uppercase (with optional underscores), leave it as is
-    if re.fullmatch(r'[A-Z_]+', text):
-        return text
+    if re.fullmatch(r'[A-Z_-]+', text):
+        return text.replace("_", " ").strip()
+
+    text = text.replace("_", " ")
+
+    # Replace hyphens between letters with spaces (preserve minus signs between digits or variables)
+    text = re.sub(r'[\u2010\u2011\u2012\u2013\u2014\u2212]', '-', text)
+    text = re.sub(r'(?<=[A-Za-z])-(?=[A-Za-z])', ' ', text)
     
-    # Step 1: Add space before capital letters that follow lowercase letters (camelCase → camel Case)
+    # Add space before capital letters that follow lowercase letters (camelCase → camel Case)
     text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', text)
     
-    # Step 2: Add space before capital letters that are followed by lowercase letters (e.g., HTMLContent → HTML Content)
+    # Add space before capital letters that are followed by lowercase letters (e.g., HTMLContent → HTML Content)
     text = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', text)
 
-    return text
+    return text.strip()
 
 def process_name_or_relationship(text: str) -> str:
     """Process a string to make it more readable.
@@ -37,8 +47,7 @@ def process_name_or_relationship(text: str) -> str:
         text (str): The string to process.
     """
     text = split_camel_case(text)
-    text = text.replace("_", " ")
-    text = text.lower()
+
     return text
 
 
