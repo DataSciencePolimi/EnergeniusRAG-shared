@@ -12,15 +12,18 @@ from langchain_community.document_transformers import Html2TextTransformer
 from langchain_core.documents import Document
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from rdflib import FOAF, OWL, RDF, RDFS, XSD, BNode, Graph, Literal, Namespace
+from langchain_experimental.text_splitter import SemanticChunker
+from rdflib import FOAF, OWL, RDF, RDFS, XSD, BNode, Graph, Literal, Namespace, URIRef
+from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 import chromadb
 from chromadb.config import Settings
 
 from llm import LLMHandler
 
-from .utils.graph_prompt import extract_descriptions_for_triples
+from .utils.graph_prompt import entities_comparator, extract_descriptions_for_entities, extract_descriptions_for_triples, representative_entity_selector, translate_chunk, summarize_chunk
 from .utils.graph_helpers import process_name_or_relationship, normalize_l2, sparql_query
+from .utils.energenius_graph import EnergeniusGraph
 
 from itertools import permutations
 
@@ -31,16 +34,16 @@ class KnowledgeExtractor:
     """_Class to create a knowledge base from a text files._"""
 
     def __init__(self, provider: str, model: str, embedding: str):
-        """Initialize the KnowledgeExtractor.
-
+        """_Initialize the KnowledgeExtractor._
         Args:
             provider (str): _Description of the model provider._
             model (str): _Description of the model name._
             embedding (str): _Description of the embedding model name._
         """
+
         # Initialize the LLMHandler and embedding model.
         self.llm_handler = LLMHandler(
-            provider=provider, model=model, temperature=0.0, language=None
+            provider=provider, model=model, temperature=0.0, language=None, keep_history=False
         )
 
         self.embeddings = init_embeddings(model=embedding, provider=provider)
@@ -49,37 +52,36 @@ class KnowledgeExtractor:
             llm=self.llm_handler.get_model(),
             #node_properties=True,
             #relationship_properties=True,
-            ignore_tool_usage=True,
-            additional_instructions="Nodes and relationships should be in English."
+            #ignore_tool_usage=True,
+            additional_instructions="""Ensure that:
+- No detail is omitted, even if implicit or inferred
+- Compound or nested relationships are captured
+- Temporal, causal, or hierarchical links are included
+- Synonyms or aliases are noted if present
+- Prefer short and concise node and relationship names
+- Do not merge multi-word entities into single tokens (e.g., Class A instead of ClassA)""",
         )
 
     def __remove_non_alphanumerical(self, s: str, hash: bool = True) -> str:
         strin = re.sub("[^A-Za-z0-9]", "_", s)
         h = hashlib.md5(s.encode()).hexdigest()
         return strin + "_" + h if hash else strin
-    
-    def __merge_strings(self, a, b):
-        """Merge two strings with maximum overlap."""
-        max_overlap = 0
-        overlap_index = 0
-        min_len = min(len(a), len(b))
-        # Check suffix of a vs prefix of b
-        for i in range(1, min_len + 1):
-            if a[-i:] == b[:i]:
-                max_overlap = i
-        return a + b[max_overlap:]
 
-    def __merge_three_overlapping_strings(self, s1, s2, s3):
-        best = None
-        max_len = float('inf')
-        for perm in permutations([s1, s2, s3]):
-            merged = self.__merge_strings(self.__merge_strings(perm[0], perm[1]), perm[2])
-            if len(merged) < max_len:
-                best = merged
-                max_len = len(merged)
-        return best
+    def _strip_quotes(self, s):
+        return s[1:-1] if s and s[0] == s[-1] and s[0] in ('"', "'") else s
+
+    def _get_last_sentence(self, text):
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        return sentences[-1] if sentences else ''
+
+    def _get_first_sentence(self, text):
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        return sentences[0] if sentences else ''
     
     def __extract_main_content(self, html):
+        # Alternatively
+        #return Html2TextTransformer().transform_documents(html_docs)
+
         soup = BeautifulSoup(html, 'html.parser')
 
         # Fallback: remove known non-content sections
@@ -90,6 +92,7 @@ class KnowledgeExtractor:
 
         # List of common tag selectors for main content
         candidates = [
+            ('main', {}),
             ('div', {'id': 'content'}),
             ('div', {'id': 'main-content'}),
             ('div', {'id': 'main'}),
@@ -107,748 +110,507 @@ class KnowledgeExtractor:
             ('div', {'class': 'blog-post'}),
             ('div', {'class': 'story'}),
             ('section', {'class': 'content'}),
+            ('section', {'id': 'content'}),
             ('section', {'class': 'main-content'}),
+            ('section', {'id': 'main-content'}),
             ('section', {'class': 'article'}),
+            ('section', {'id': 'article'}),
             ('section', {}),
-            ('article', {}),
-            ('main', {}),
         ]
 
         # Try each candidate selector in order
         for tag, attrs in candidates:
             matches = soup.find_all(tag, attrs=attrs)
             if matches:
-                return '\n'.join(
-                    match.get_text(separator='\n', strip=True)
+                return '\n\n'.join(
+                    BeautifulSoup(
+                        re.sub(r'(?i)<(h[1-6]\b[^>]*)>', r'|<\1>', str(match)),
+                        'html.parser'
+                    ).get_text(separator='\n', strip=True).replace("||", "|")
                     for match in matches
                 )
 
         return soup.get_text(separator='\n', strip=True)
 
+    # Run the extraction
     def run(
         self,
         file_name: str,
-        load_existing: bool,
+        folder: str = "files",
         html_links: list[str] = None,
-        pdf_links: list[str] = None,
-        use_embedding: bool = True,
-        use_descriptions: bool = True,
+        load_cached_docs: bool = True,
+        load_cached_preprocessed_chunks: bool = False,
+        load_cached_graph_documents: bool = False,
+        load_cached_triple_descriptions: bool = False,
+        load_cached_entity_descriptions: bool = False,
+        load_cached_embeddings: bool = False,
     ) -> None:
         """_Main function to create the knowledge base._
         Args:
-            load_existing (bool): _Description of the load_existing parameter._
-            html_links (list[str], optional): _Description of the html_links parameter._ Defaults to None.
-            pdf_links (list[str], optional): _Description of the pdf_links parameter._ Defaults to None.
-            use_embedding (bool, optional): _Description of the use_embedding parameter._ Defaults to True.
-            use_descriptions (bool, optional): _Description of the use_descriptions parameter._ Defaults to True.
+            file_name (str): Name of the input file to process.
+            folder (str, optional): Folder where the file is located. Defaults to "files".
+            html_links (list[str], optional): List of HTML links to include as additional sources. Defaults to None.
+            load_cached_docs (bool, optional): Whether to load previously cached documents. Defaults to False.
+            load_cached_preprocessed_chunks (bool, optional): Whether to load cached preprocessed text chunks. Defaults to False.
+            load_cached_graph_documents (bool, optional): Whether to load cached graph-based documents. Defaults to False.
+            load_cached_triple_descriptions (bool, optional): Whether to load cached triple descriptions. Defaults to False.
+            load_cached_entity_descriptions (bool, optional): Whether to load cached entity descriptions. Defaults to False.
+            load_cached_embeddings (bool, optional): Whether to load cached embeddings for the knowledge base. Defaults to False.
         """
 
         # Initialize the variables
         dir_path = os.path.dirname(os.path.realpath(__file__))
-        html_docs = None
-        pdf_docs = []
+        path = os.path.join(dir_path, folder)
 
         # Checking if files folder is present
-        if not os.path.exists(os.path.join(dir_path, "files")):
-            os.makedirs(os.path.join(dir_path, "files"))
+        if not os.path.exists(path):
+            os.makedirs(path)
 
-        if load_existing:
+        # --- Download documents ---
+
+        if load_cached_docs:
             try:
-                print("Trying to load existing graph_documents.joblib")
-                graph_documents = joblib.load(
-                    os.path.join(
-                        os.path.dirname(os.path.realpath(__file__)),
-                        "files",
-                        "graph_documents.joblib",
-                    )
-                )
-                print("Trying to load existing all_docs.joblib")
-                all_docs = joblib.load(
-                    os.path.join(
-                        os.path.dirname(os.path.realpath(__file__)),
-                        "files",
-                        "all_docs.joblib",
-                    )
-                )
+                print("Trying to load existing raw_docs.joblib")
+                raw_docs = joblib.load(os.path.join(path, "raw_docs.joblib"))  # Load
             except FileNotFoundError:
-                print(
-                    "No existing knowledge base found. Please create a new one or set load_existing to False."
-                )
+                print("No existing knowledge base found.")
                 return
         else:
-            # Check if the user wants to load an existing knowledge base
-            if load_existing:
-                try:
-                    print("Trying to load existing html_docs.joblib")
-                    html_docs = joblib.load(
-                        os.path.join(dir_path, "files", "html_docs.joblib")
-                    )
-                except FileNotFoundError:
-                    print(
-                        "No existing HTML documents found. Please create a new one or set load_existing to False."
-                    )
-                    return
-            else:
-                if html_links is not None:
-                    html_loader = AsyncHtmlLoader(html_links)
-                    html_docs = html_loader.load()
-                    # Save the html_docs to a file for later use
-                    joblib.dump(
-                        html_docs, os.path.join(dir_path, "files", "html_docs.joblib")
-                    )
+            html_loader = AsyncHtmlLoader(html_links)
+            raw_docs = html_loader.load()
 
-            #html2text = Html2TextTransformer()
-            #html_docs_transformed = html2text.transform_documents(html_docs)
-            html_docs_transformed = html_docs
-            with open("html_parsed.txt", "w", encoding="utf-8") as f:
-                for html_doc in html_docs_transformed:
-                    html_doc.page_content = self.__extract_main_content(html_doc.page_content)
-                    f.write(f"{html_doc}")
+            joblib.dump(raw_docs, os.path.join(path, "raw_docs.joblib")) # Save
 
-            # Check if the user wants to load an existing pdf knowledge base
-            if load_existing:
-                try:
-                    print("Trying to load existing pdf_docs.joblib")
-                    pdf_docs = joblib.load(
-                        os.path.join(dir_path, "files", "pdf_docs.joblib")
-                    )
-                except FileNotFoundError:
-                    print(
-                        "No existing PDF documents found. Please create a new one or set load_existing to False."
-                    )
-                    return
-            else:
-                if pdf_links is not None and len(pdf_links) > 0:
-                    for p in tqdm(pdf_links, desc="Fetching PDFs: "):
-                        pdf_docs.append(PyPDFLoader(p).load())
+        # --- Process documents ---
 
-                for i, pdf_doc_pages in enumerate(
-                    tqdm(pdf_docs, desc="Processing PDFs: ")
-                ):
-                    source = ""
-                    pages = ""
-                    for j, page in enumerate(pdf_doc_pages):
-                        source = page.metadata["source"]
-                        pages += page.page_content
-                    pdf_docs[i] = Document(
-                        page_content=pages, metadata={"source": source}
-                    )
+        # Strip html tags
+        processed_docs = raw_docs
+        for doc in processed_docs:
+            doc.page_content = self.__extract_main_content(doc.page_content)
 
-                # Save the pdf_docs to a file for later use
-                joblib.dump(
-                    pdf_docs, os.path.join(dir_path, "files", "pdf_docs.joblib")
-                )
+        # Semantic chunker
+        chunker = SemanticChunker(
+            embeddings=self.embeddings,
+            sentence_split_regex=r"(?<=[.!?|])\s+",
+            breakpoint_threshold_type='standard_deviation', breakpoint_threshold_amount=2,
+            min_chunk_size=100
+        )
+        chunks = chunker.split_documents(processed_docs)
+        
+        # Size limiter 1
+        size_limiter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=0,
+            length_function=len,
+            separators=["|"],
+        )
+        temp_chunks = []
+        for chunk in chunks:
+            limited_chunks = size_limiter.split_text(chunk.page_content)
+            # Grouping small chunks
+            for i, _ in enumerate(limited_chunks):
+                if len(limited_chunks[i]) <= 99 and i < len(limited_chunks)-1:
+                    limited_chunks[i] = f"{limited_chunks[i]}\n{limited_chunks[i+1]}"
+                    del limited_chunks[i]
+            # Final chunks list
+            for text in limited_chunks:
+                temp_chunks.append(chunk.model_copy(update={"page_content": text}))
+        chunks = temp_chunks
+        
+        # Size limiter 2
+        size_limiter = RecursiveCharacterTextSplitter(
+            chunk_size=1500,
+            chunk_overlap=0,
+            length_function=len,
+            separators=[".", "!", "?"],
+        )
+        temp_chunks = []
+        for chunk in chunks:
+            limited_chunks = size_limiter.split_text(chunk.page_content)
+            # Grouping small chunks
+            for i, _ in enumerate(limited_chunks):
+                if len(limited_chunks[i]) <= 99 and i < len(limited_chunks)-1:
+                    limited_chunks[i] = f"{limited_chunks[i]}\n{limited_chunks[i+1]}"
+                    del limited_chunks[i]
+            # Final chunks list
+            for text in limited_chunks:
+                temp_chunks.append(chunk.model_copy(update={"page_content": text}))
+        chunks = temp_chunks
+
+        print(f"> Number of documents: {len(processed_docs)}")
+        print(f"> Number of chunks: {len(chunks)}")
+        #print("\n\n\n".join([str(chunk) for chunk in chunks]))
+
+
+        # --- LLM pre-processing ---
+
+        if load_cached_preprocessed_chunks:
+            try:
+                print("Trying to load existing preprocessed_chunks.joblib")
+                preprocessed_chunks = joblib.load(os.path.join(path, "preprocessed_chunks.joblib"))  # Load
+            except FileNotFoundError:
+                print("No existing knowledge base found.")
+                return
+        else:
+            preprocessed_chunks = chunks
+            
+            for i in tqdm(range(len(preprocessed_chunks)), desc="Translation & summarization of the chunks: "):
+
+                # Translation
+                if "en" not in preprocessed_chunks[i].metadata["language"].lower():
+                    preprocessed_chunks[i].page_content = self._strip_quotes(
+                        self.llm_handler.generate_response(translate_chunk(), f"{preprocessed_chunks[i].page_content}", False)
+                    )
                 
-            if len(pdf_docs) != 0:
-                all_docs = pdf_docs + html_docs_transformed
-            else:
-                all_docs = html_docs_transformed
+                # Summarization
+                prev = preprocessed_chunks[i - 1].page_content if i > 0 else ""
+                curr = preprocessed_chunks[i].page_content
+                next_ = preprocessed_chunks[i + 1].page_content if i < len(preprocessed_chunks) - 1 else ""
+                context = "\n".join(filter(None, [
+                    self._get_last_sentence(prev) if prev else None,
+                    curr,
+                    self._get_first_sentence(next_) if next_ else None
+                ]))
+                print(f"\n\n{context}")
+                preprocessed_chunks[i].page_content = self._strip_quotes(
+                    self.llm_handler.generate_response(summarize_chunk(), context, False)
+                ).replace("\n\n", "\n")
 
-            # Create all_docs
-            joblib.dump(
-                all_docs,
-                os.path.join(dir_path, "files", "all_docs.joblib"),
-            )
+            joblib.dump(preprocessed_chunks, os.path.join(path, "preprocessed_chunks.joblib")) # Save
 
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=750,
-                chunk_overlap=250,
-                length_function=len,
-                separators=[".\n", ". ", "\n\n"],
-            )
 
-            split_documents = text_splitter.split_documents(all_docs)
+        # --- LLM conversion to graph documents ---
 
-            print(f"> Number of HTML documents: {len(html_docs)}")
-            print(f"> Number of PDF documents: {len(pdf_docs)}")
-            print(f"> Number of documents: {len(all_docs)}")
-            print(f"> Number of chunks: {len(split_documents)}")
-            print("Starting to convert to graph documents...")
+        if load_cached_graph_documents:
+            try:
+                print("Trying to load existing graph_documents.joblib")
+                graph_documents = joblib.load(os.path.join(path, "graph_documents.joblib"))  # Load
+            except FileNotFoundError:
+                print("No existing knowledge base found.")
+                return
+        else:
+            
+            graph_documents = []
+            for doc in tqdm(preprocessed_chunks, desc="Conversion to graph documents: "): # Nodes and relationships extraction
+                graph_from_chunk = self.llm_graph_transformer.convert_to_graph_documents([doc])[0]
+                print("\n".join([f"{rel.source.id} ({rel.source.type}), {rel.type}, {rel.target.id} ({rel.target.type})" for rel in graph_from_chunk.relationships]))
+                graph_documents.append(graph_from_chunk)
+                
+            joblib.dump(graph_documents, os.path.join(path, "graph_documents.joblib")) # Save
 
-            graph_documents = self.llm_graph_transformer.convert_to_graph_documents(
-                split_documents
-            )
+        
+        # --- Syntactic disambiguation ---
 
-            print("Ending to convert to graph documents...")
+        def is_valid_text(text):
+            # Check for non-empty alphanumeric content
+            if not re.match(r'^(?=.*[a-zA-Z0-9]).+$', text):
+                return False
+            # Split by space and underscore, then count words
+            words = re.split(r'[ _]+', text)
+            return len(words) <= 5
 
-            # Create the knowledge base
-            joblib.dump(
-                graph_documents,
-                os.path.join(dir_path, "files", "graph_documents.joblib"),
-            )
+        # For each chunk
+        all_entities = {}
+        for i, graph_doc in enumerate(graph_documents):
 
-        if use_embedding:
-            if load_existing:
-                try:
-                    print(
-                        "Trying to load existing graph_documents_and_embeddings.joblib"
-                    )
-                    graph_documents = joblib.load(
-                        os.path.join(
-                            dir_path,
-                            "files",
-                            "graph_documents_and_embeddings.joblib",
-                        )
-                    )
-                except FileNotFoundError:
-                    print(
-                        "No existing knowledge base found. Please create a new one or set load_existing to False."
-                    )
-                    load_existing = False
-                    
-            if not load_existing:
-                # Syntactic disambiguation
-                for i, doc in enumerate(
-                    tqdm(all_docs, desc="Syntactic disambiguation of documents: ")
-                ):
-                    # For each chunk in this "full document" -> filter chunks from "graph document"
-                    for j, chunk in enumerate(
-                        [
-                            doc_chunk
-                            for doc_chunk in graph_documents
-                            if doc_chunk.source.metadata["source"]
-                            == doc.metadata["source"]
-                        ]
-                    ):
+            # Filter out empty/too long triples
+            graph_doc.relationships = [
+                rel for rel in graph_doc.relationships
+                if is_valid_text(rel.source.id)
+                and is_valid_text(rel.type)
+                and is_valid_text(rel.target.id)
+            ]
 
-                        # Entities (nodes)
-                        for _, node in enumerate(chunk.nodes):
+            # Entities and relationships
+            for k, rel in enumerate(graph_doc.relationships):
+                                
+                s1c = rel.source.id.count(' ')
+                s2c = rel.target.id.count(' ')
+                if s1c > 6 or s2c > 6:
+                    print(rel.source.id, rel.type, rel.target.id)
 
-                            node.id = process_name_or_relationship(node.id)
-                            node.type = process_name_or_relationship(node.type)
+                rel.source.id = process_name_or_relationship(rel.source.id)
+                if re.match(r'^(?=.*[a-zA-Z0-9]).+$', rel.source.id):
+                    all_entities[rel.source.id] = rel.source.id
 
-                        # Relationships
-                        for k, rel in enumerate(chunk.relationships):
+                rel.source.type = process_name_or_relationship(rel.source.type)
+                if re.match(r'^(?=.*[a-zA-Z0-9]).+$', rel.source.type):
+                    all_entities[rel.source.type] = rel.source.type
 
-                            rel.source.id = process_name_or_relationship(rel.source.id)
-                            rel.type = process_name_or_relationship(rel.type)
-                            rel.target.id = process_name_or_relationship(rel.target.id)
+                rel.target.id = process_name_or_relationship(rel.target.id)
+                if re.match(r'^(?=.*[a-zA-Z0-9]).+$', rel.target.id):
+                    all_entities[rel.target.id] = rel.target.id
 
-                for i, doc in enumerate(tqdm(all_docs, desc="Embedding documents: ")):
-                    # doc.page_content = {'text': doc.page_content, 'embedding': embeddings.embed_query(doc.page_content)}
+                rel.target.type = process_name_or_relationship(rel.target.type)
+                if re.match(r'^(?=.*[a-zA-Z0-9]).+$', rel.target.type):
+                    all_entities[rel.target.type] = rel.target.type
+            
+        # Compute cosine similarity matrix
+        merged_map = {}
+        for iterations in range(5):
+            if not all_entities: break
 
-                    # For each chunk in this "full document" -> filter chunks from "graph document"
-                    for j, chunk in enumerate(
-                        tqdm(
-                            [
-                                doc_chunk
-                                for doc_chunk in graph_documents
-                                if doc_chunk.source.metadata["source"]
-                                == doc.metadata["source"]
-                            ]
-                        )
-                    ):
+            ids = list(all_entities.keys())
+            embeddings = np.array([self.embeddings.embed_query(key) for key in ids])
+            similarity_matrix = cosine_similarity(embeddings)
 
-                        chunk.source.page_content = {
-                            "text": chunk.source.page_content,
-                            "embedding": self.embeddings.embed_query(
-                                chunk.source.page_content
-                            ),
-                        }
+            # Group similar nodes
+            new_merged_map = {}
+            for i in tqdm(range(len(ids)), desc="Syntactic disambiguation: "):
+                for j in range(i + 1, len(ids)):
+                    if similarity_matrix[i][j] > 0.9 and not re.search(r'\d', ids[i]) and not re.search(r'\d', ids[j]): # No numbers
+                        same = self.llm_handler.generate_response(entities_comparator(), f"{ids[i]}\n{ids[j]}", False) == "Same" # If they are not the same thing
+                        if same:
+                            def to_keep(s1, s2):
+                                s1c = s1.count(' ')
+                                s2c = s2.count(' ')
+                                if s1c > s2c and s1c < 5: return s1
+                                elif s1c < s2c and s1c < 5: return s2
+                                else: return s1 if len(s1) <= len(s2) else s2
+                            ent = to_keep(ids[i],ids[j]) # Chose which of the two to keep
+                            print(f"{ids[i]} - {ids[j]} -> {ent}")
+                            # Merge j into i
+                            new_merged_map[ids[i]] = ent
+                            new_merged_map[ids[j]] = ent
+            all_entities = {v: v for v in new_merged_map.values()}
+            
+            # Update graph_documents
+            for graph_doc in graph_documents:
+                for rel in graph_doc.relationships:
+                    if rel.source.id in new_merged_map: rel.source.id = new_merged_map[rel.source.id]
+                    if rel.source.type in new_merged_map: rel.source.type = new_merged_map[rel.source.type]
+                    if rel.target.id in new_merged_map: rel.target.id = new_merged_map[rel.target.id]
+                    if rel.target.type in new_merged_map: rel.target.type = new_merged_map[rel.target.type]
+        
 
-                        # Entities (nodes)
-                        for k, node in enumerate(chunk.nodes):
-                            node.id = {
-                                "text": node.id,
-                                "embedding": self.embeddings.embed_query(node.id),
-                            }
-                            node.type = {
-                                "text": node.type,
-                                "embedding": self.embeddings.embed_query(node.type),
-                            }
-
-                        # Relationships
-                        for k, rel in enumerate(chunk.relationships):
-                            rel.type = {
-                                "text": rel.type,
-                                "embedding": self.embeddings.embed_query(rel.type),
-                                "triple_embedding": self.embeddings.embed_query(rel.source.id + " " + rel.type + " " + rel.target.id),
-                            }
-
-                # Reducing embedding dimensions
-                """ for doc in tqdm(
-                    graph_documents, desc="Reducing embedding dimensions: "
-                ):
-                    for node in doc.nodes:
-                        node.id["embedding"] = normalize_l2(
-                            node.id["embedding"][:512]
-                        )  # node.id["embedding"]
-                        node.type["embedding"] = normalize_l2(
-                            node.type["embedding"][:512]
-                        )  # node.id["embedding"]
-                        # print(node.id["text"], len(node.id["embedding"]), node.type["text"], len(node.type["embedding"]))
-                    for rel in doc.relationships:
-                        rel.type["embedding"] = normalize_l2(
-                            rel.type["embedding"][:512]
-                        )  # rel.type["embedding"]
-                        # print(rel.source.id, rel.type["text"], len(rel.type["embedding"]), rel.target.id)
-                    doc.source.page_content["embedding"] = normalize_l2(
-                        doc.source.page_content["embedding"][:512]
-                    )  # doc.source.page_content["embedding"] """
-
-                # Export the knowledge base
-                joblib.dump(
-                    graph_documents,
-                    os.path.join(
-                        dir_path, "files", "graph_documents_and_embeddings.joblib"
-                    ),
-                )
-
+        # --- Store in the KG ---
 
         # Initialize RDF Graph
-        rdf_graph = Graph()
+        graph = EnergeniusGraph()
+        graph.load_ontology()
 
-        # Define Namespaces
-        EX = Namespace("http://example.org/data#")
-        ONTO = Namespace("http://example.org/ontology#")
-
-        # Bind namespaces to prefixes for readability
-        rdf_graph.bind("ex", EX)
-        rdf_graph.bind("onto", ONTO)
-        rdf_graph.bind("rdf", RDF)
-        rdf_graph.bind("rdfs", RDFS)
-        rdf_graph.bind("owl", OWL)
-        rdf_graph.bind("foaf", FOAF)
-
-        # --- Define Classes ---
-        classes = [
-            "Document",
-            "Chunk",
-            "Entity",
-            "Relationship",
-            "Triple",
-            # "Property",
-            # "CommunityReport",
-            # "Community",
-            # "Finding"
-        ]
-
-        for cls in classes:
-            rdf_graph.add((ONTO[cls], RDF.type, OWL.Class))
-
-        # --- Define Properties ---
-
-        # Object Properties
-        object_properties = {
-            # Chunks & documents
-            "hasChunk": {
-                "domain": "Document",
-                "range": "Chunk",
-                "type": OWL.ObjectProperty,
-            },
-            "belongsToDocument": {
-                "domain": "Chunk",
-                "range": "Document",
-                "type": OWL.ObjectProperty,
-            },
-            "hasNext": {
-                "domain": "Chunk",
-                "range": "Chunk",
-                "type": OWL.ObjectProperty,
-            },
-            "hasPrevious": {
-                "domain": "Chunk",
-                "range": "Chunk",
-                "type": OWL.ObjectProperty,
-            },
-            # Entity
-            "hasType": {
-                "domain": "Entity",
-                "range": "Entity",
-                "type": OWL.ObjectProperty,
-            },
-            #"hasProperty": {
-            #    "domain": "Entity",
-            #    "range": "Property",
-            #    "type": OWL.ObjectProperty,
-            #},
-            # Relationship
-            "relatesTarget": {
-                "domain": "Entity",
-                "range": "Entity",
-                "type": OWL.ObjectProperty,
-            },
-            "relatesSource": {
-                "domain": "Entity",
-                "range": "Entity",
-                "type": OWL.ObjectProperty,
-            },
-            "hasSource": {
-                "domain": ["Relationship", "Triple"],
-                "range": "Entity",
-                "type": OWL.ObjectProperty,
-            },
-            "isSourceOf": {
-                "domain": "Entity",
-                "range": "Relationship",
-                "type": OWL.ObjectProperty,
-            },
-            "hasTarget": {
-                "domain": ["Relationship", "Triple"],
-                "range": "Entity",
-                "type": OWL.ObjectProperty,
-            },
-            "isTargetOf": {
-                "domain": "Entity",
-                "range": "Relationship",
-                "type": OWL.ObjectProperty,
-            },
-            "composes": {
-                "domain":  ["Relationship", "Entity"],
-                "range": "Triple",
-                "type": OWL.ObjectProperty,
-            },
-            # References
-            "hasEntity": {
-                "domain": ["Document", "Chunk"],
-                "range": "Entity",
-                "type": OWL.ObjectProperty,
-            },
-            "hasRelationship": {
-                "domain": ["Document", "Chunk", "Triple"],
-                "range": "Relationship",
-                "type": OWL.ObjectProperty,
-            },
-            "belongsToChunk": {
-                "domain": ["Entity", "Relationship", "Triple"],
-                "range": "Chunk",
-                "type": OWL.ObjectProperty,
-            },
-        }
-
-        # Datatype Properties
-        datatype_properties = {
-            # Documents & Chunks
-            "hasUri": {
-                "domain": ["Document", "Chunk"],
-                "range": XSD.string,
-                "type": OWL.DatatypeProperty,
-            },
-            "hasContent": {
-                "domain": ["Document", "Chunk"],
-                "range": XSD.string,
-                "type": OWL.DatatypeProperty,
-            },
-            "hasContentEmbedding": {
-                "domain": ["Document", "Chunk"],
-                "range": XSD.string,
-                "type": OWL.DatatypeProperty,
-            },
-            # Entities, Relationships & Properties
-            "hasName": {
-                "domain": ["Entity", "Relationship"],
-                "range": XSD.string,
-                "type": OWL.DatatypeProperty,
-            },
-            "hasNameEmbedding": {
-                "domain": ["Entity", "Relationship"],
-                "range": XSD.string,
-                "type": OWL.DatatypeProperty,
-            },
-            "hasDescription": {
-                "domain": ["Entity", "Relationship", "Triple"],
-                "range": XSD.string,
-                "type": OWL.DatatypeProperty,
-            },
-            #"hasValue": {
-            #    "domain": ["Property"],
-            #    "range": XSD.string,
-            #    "type": OWL.DatatypeProperty,
-            #},
-            #"hasValueEmbedding": {
-            #    "domain": ["Property"],
-            #    "range": XSD.string,
-            #    "type": OWL.DatatypeProperty,
-            #},
-        }
-
-        # Add Object Properties to the Graph
-        for prop, details in object_properties.items():
-            rdf_graph.add((ONTO[prop], RDF.type, details["type"]))
-            # Handle multiple domains
-            domains = (
-                details["domain"]
-                if isinstance(details["domain"], list)
-                else [details["domain"]]
-            )
-            for domain in domains:
-                rdf_graph.add((ONTO[prop], RDFS.domain, ONTO[domain]))
-            #rdf_graph.add((ONTO[prop], RDFS.domain, ONTO[details["domain"]]))
-            rdf_graph.add((ONTO[prop], RDFS.range, ONTO[details["range"]]))
-
-        # Add Datatype Properties to the Graph
-        for prop, details in datatype_properties.items():
-            rdf_graph.add((ONTO[prop], RDF.type, details["type"]))
-            # Handle multiple domains
-            domains = (
-                details["domain"]
-                if isinstance(details["domain"], list)
-                else [details["domain"]]
-            )
-            for domain in domains:
-                rdf_graph.add((ONTO[prop], RDFS.domain, ONTO[domain]))
-            rdf_graph.add((ONTO[prop], RDFS.range, details["range"]))
-
-
-
-        # Load chromadb
-        client = chromadb.PersistentClient(
-            path="knowledge_base/files/chroma_db",
-            settings=Settings(
-                anonymized_telemetry=False
-            ),
-        )
-        collection_chunk_embeddings = client.get_or_create_collection(name="graph_chunk_embeddings")
-        collection_entity_embeddings = client.get_or_create_collection(name="graph_entity_embeddings")
-        collection_relationship_embeddings = client.get_or_create_collection(name="graph_relationship_embeddings")
-        collection_triple_embeddings = client.get_or_create_collection(name="graph_triple_embeddings")
-
-
-        # For each "full document"
-        for i, doc in enumerate(
-            tqdm(all_docs, desc="Processing documents into the graph: ")
-        ):
+        # For each unique "full document"
+        for i, graph_doc_source in enumerate(tqdm({doc.source.metadata["source"] for doc in graph_documents}, desc="RDF graph creation: ")):
 
             # Document
-            doc_id = doc.metadata["source"]
-            doc_uri = EX[f"Document_{doc_id}"]
-            rdf_graph.add((doc_uri, RDF.type, ONTO.Document))
-            rdf_graph.add((doc_uri, ONTO.hasUri, Literal(doc_id, datatype=XSD.string)))
-            # rdf_graph.add((doc_uri, ONTO.hasContent, Literal(doc.page_content["text"], datatype=XSD.string)))
-            # rdf_graph.add((doc_uri, ONTO.hasContentEmbedding, Literal(doc.page_content["embedding"], datatype=XSD.string)))
+            doc_id = graph_doc_source
+            doc_uri = graph.EX[f"Document_{doc_id}"]
+            graph.rdf_graph.add((doc_uri, RDF.type, graph.ONTO.Document))
+            graph.rdf_graph.add((doc_uri, graph.ONTO.hasUri, Literal(doc_id, datatype=XSD.string)))
 
-            # if hasattr(doc.metadata, 'title'):
-            #    rdf_graph.add((doc_uri, ONTO.hasTitle, Literal(doc.metadata.title, datatype=XSD.string)))
-            # if hasattr(doc.metadata, 'description'):
-            #    rdf_graph.add((doc_uri, ONTO.hasDescription, Literal(doc.metadata.description, datatype=XSD.string)))
+        # For each chunk in this "full document" -> filter chunks from "graph document"
+        for j, chunk in enumerate([doc_chunk for doc_chunk in graph_documents]):
 
-            # For each chunk in this "full document" -> filter chunks from "graph document"
-            for j, chunk in enumerate(
-                [
-                    doc_chunk
-                    for doc_chunk in graph_documents
-                    if doc_chunk.source.metadata["source"] == doc_id
-                ]
-            ):
+            # Chunk
+            doc_id = chunk.source.metadata["source"]
+            doc_uri = graph.EX[f"Document_{doc_id}"]
+            chunk_uri = graph.EX[f"Chunk_{doc_id}_{j}"]
+            graph.rdf_graph.add((chunk_uri, RDF.type, graph.ONTO.Chunk))
+            graph.rdf_graph.add((chunk_uri, graph.ONTO.hasUri, Literal(chunk_uri, datatype=XSD.string)))
+            graph.rdf_graph.add((chunk_uri, graph.ONTO.hasContent, Literal(chunk.source.page_content, datatype=XSD.string)))
 
-                # Chunk
-                chunk_uri = EX[f"Chunk_{doc_id}_{j}"]
-                rdf_graph.add((chunk_uri, RDF.type, ONTO.Chunk))
-                rdf_graph.add(
-                    (chunk_uri, ONTO.hasUri, Literal(chunk_uri, datatype=XSD.string))
-                )
-                rdf_graph.add(
-                    (
-                        chunk_uri,
-                        ONTO.hasContent,
-                        Literal(chunk.source.page_content["text"], datatype=XSD.string),
-                    )
-                )
-                #rdf_graph.add(
-                #    (
-                #        chunk_uri,
-                #        ONTO.hasContentEmbedding,
-                #        Literal(
-                #            chunk.source.page_content["embedding"], datatype=XSD.string
-                #        ),
-                #    )
-                #)
-                collection_chunk_embeddings.add(embeddings=[chunk.source.page_content["embedding"]], ids=[chunk_uri])
-                rdf_graph.add((doc_uri, ONTO.hasChunk, chunk_uri))
-                rdf_graph.add((chunk_uri, ONTO.belongsToDocument, doc_uri))
+            graph.rdf_graph.add((doc_uri, graph.ONTO.hasChunk, chunk_uri))
+            graph.rdf_graph.add((chunk_uri, graph.ONTO.belongsToDocument, doc_uri))
 
-                if j > 0:
-                    previous_chunk_uri = EX[f"Chunk_{doc_id}_{j-1}"]
-                    rdf_graph.add((previous_chunk_uri, ONTO.hasNext, chunk_uri))
-                    rdf_graph.add((chunk_uri, ONTO.hasPrevious, previous_chunk_uri))
+            if j > 0:
+                previous_chunk_uri = graph.EX[f"Chunk_{doc_id}_{j-1}"]
+                graph.rdf_graph.add((previous_chunk_uri, graph.ONTO.hasNext, chunk_uri))
+                graph.rdf_graph.add((chunk_uri, graph.ONTO.hasPrevious, previous_chunk_uri))
 
-                # Entities (nodes)
-                for k, node in enumerate(chunk.nodes):
+            # Entities and relationships
+            for k, rel in enumerate(chunk.relationships):
 
-                    node_id = node.id["text"]
-                    node_id_embedding = node.id["embedding"]
+                # Source entity
+                source_entity_id = self.__remove_non_alphanumerical(rel.source.id)
+                source_entity_uri = graph.EX[f"Entity_{source_entity_id}"]
+                graph.rdf_graph.add((source_entity_uri, RDF.type, graph.ONTO.Entity))
+                graph.rdf_graph.add((source_entity_uri, graph.ONTO.hasName, Literal(rel.source.id, datatype=XSD.string)))
+                
+                source_entity_type_id = self.__remove_non_alphanumerical(rel.source.type)
+                source_entity_type_uri = graph.EX[f"EntityType_{source_entity_type_id}"]
+                graph.rdf_graph.add((source_entity_type_uri, RDF.type, graph.ONTO.EntityType))
+                graph.rdf_graph.add((source_entity_type_uri, graph.ONTO.hasName, Literal(rel.source.type, datatype=XSD.string)))
+                
+                graph.rdf_graph.add((source_entity_uri, graph.ONTO.hasType, source_entity_type_uri))
+                graph.rdf_graph.add((source_entity_type_uri, graph.ONTO.isTypeOf, source_entity_uri))
 
-                    entity_id = self.__remove_non_alphanumerical(node_id)
-                    entity_uri = EX[f"Entity_{entity_id}"]
-                    rdf_graph.add((entity_uri, RDF.type, ONTO.Entity))
-                    rdf_graph.add(
-                        (
-                            entity_uri,
-                            ONTO.hasName,
-                            Literal(node_id, datatype=XSD.string),
-                        )
-                    )
-                    #rdf_graph.add(
-                    #    (
-                    #        entity_uri,
-                    #        ONTO.hasNameEmbedding,
-                    #        Literal(node_id_embedding, datatype=XSD.string),
-                    #    )
-                    #)
-                    collection_entity_embeddings.add(embeddings=[node_id_embedding], ids=[entity_uri])
+                graph.rdf_graph.add((chunk_uri, graph.ONTO.hasEntity, source_entity_uri))
+                graph.rdf_graph.add((doc_uri, graph.ONTO.hasEntity, source_entity_uri))
 
-                    node_type = node.type["text"]
-                    node_type_embedding = node.type["embedding"]
+                graph.rdf_graph.add((source_entity_uri, graph.ONTO.belongsToChunk, chunk_uri))
+                graph.rdf_graph.add((source_entity_uri, graph.ONTO.belongsToDocument, doc_uri))
 
-                    entity_type_id = self.__remove_non_alphanumerical(node_type)
-                    entity_type_uri = EX[f"Entity_{entity_type_id}"]
-                    rdf_graph.add((entity_type_uri, RDF.type, ONTO.Entity))
-                    rdf_graph.add(
-                        (
-                            entity_type_uri,
-                            ONTO.hasName,
-                            Literal(node_type, datatype=XSD.string),
-                        )
-                    )
-                    #rdf_graph.add(
-                    #    (
-                    #        entity_type_uri,
-                    #        ONTO.hasNameEmbedding,
-                    #        Literal(node_type_embedding, datatype=XSD.string),
-                    #    )
-                    #)
-                    collection_entity_embeddings.add(embeddings=[node_type_embedding], ids=[entity_type_uri])
+                graph.rdf_graph.add((source_entity_type_uri, graph.ONTO.belongsToChunk, chunk_uri))
+                graph.rdf_graph.add((source_entity_type_uri, graph.ONTO.belongsToDocument, doc_uri))
 
-                    rdf_graph.add((entity_uri, ONTO.hasType, entity_type_uri))
+                # Target entity
+                target_entity_id = self.__remove_non_alphanumerical(rel.target.id)
+                target_entity_uri = graph.EX[f"Entity_{target_entity_id}"]
+                graph.rdf_graph.add((target_entity_uri, RDF.type, graph.ONTO.Entity))
+                graph.rdf_graph.add((target_entity_uri, graph.ONTO.hasName, Literal(rel.target.id, datatype=XSD.string)))
+                
+                target_entity_type_id = self.__remove_non_alphanumerical(rel.target.type)
+                target_entity_type_uri = graph.EX[f"EntityType_{target_entity_type_id}"]
+                graph.rdf_graph.add((target_entity_type_uri, RDF.type, graph.ONTO.EntityType))
+                graph.rdf_graph.add((target_entity_type_uri, graph.ONTO.hasName, Literal(rel.target.type, datatype=XSD.string)))
+                
+                graph.rdf_graph.add((target_entity_uri, graph.ONTO.hasType, target_entity_type_uri))
+                graph.rdf_graph.add((target_entity_type_uri, graph.ONTO.isTypeOf, target_entity_uri))
 
-                    """ for key, value in node.properties.items():
-                        property_id = self.__remove_non_alphanumerical(key)
-                        property_uri = EX[f"Property_{property_id}_{entity_id}"]
-                        rdf_graph.add((property_uri, RDF.type, ONTO.Property))
-                        rdf_graph.add((entity_uri, ONTO.hasProperty, property_uri))
-                        rdf_graph.add(
-                            (
-                                property_uri,
-                                ONTO.hasName,
-                                Literal(key, datatype=XSD.string),
-                            )
-                        )
-                        rdf_graph.add(
-                            (
-                                property_uri,
-                                ONTO.hasValue,
-                                Literal(value, datatype=XSD.string),
-                            )
-                        ) """
+                graph.rdf_graph.add((chunk_uri, graph.ONTO.hasEntity, target_entity_uri))
+                graph.rdf_graph.add((doc_uri, graph.ONTO.hasEntity, target_entity_uri))
 
-                    rdf_graph.add((chunk_uri, ONTO.hasEntity, entity_uri))
-                    rdf_graph.add((chunk_uri, ONTO.hasEntity, entity_type_uri))
-                    rdf_graph.add((doc_uri, ONTO.hasEntity, entity_uri))
-                    rdf_graph.add((doc_uri, ONTO.hasEntity, entity_type_uri))
+                graph.rdf_graph.add((target_entity_uri, graph.ONTO.belongsToChunk, chunk_uri))
+                graph.rdf_graph.add((target_entity_uri, graph.ONTO.belongsToDocument, doc_uri))
 
-                    rdf_graph.add((entity_uri, ONTO.belongsToChunk, chunk_uri))
-                    rdf_graph.add((entity_uri, ONTO.belongsToDocument, doc_uri))
-                    rdf_graph.add((entity_type_uri, ONTO.belongsToChunk, chunk_uri))
-                    rdf_graph.add((entity_type_uri, ONTO.belongsToDocument, doc_uri))
-
-                # Relationships
-                for k, rel in enumerate(chunk.relationships):
-
-                    rel_type = rel.type["text"]
-                    rel_type_embedding = rel.type["embedding"]
-                    rel_type_triple_embedding = rel.type["embedding"]
-
-                    rel_id = self.__remove_non_alphanumerical(rel_type)
-                    rel_uri = EX[f"Relationship_{rel_id}"]
-                    rdf_graph.add((rel_uri, RDF.type, ONTO.Relationship))
-                    rdf_graph.add(
-                        (rel_uri, ONTO.hasName, Literal(rel_type, datatype=XSD.string))
-                    )
-                    #rdf_graph.add(
-                    #    (
-                    #        rel_uri,
-                    #        ONTO.hasNameEmbedding,
-                    #        Literal(rel_type_embedding, datatype=XSD.string),
-                    #    )
-                    #)
-                    collection_relationship_embeddings.add(embeddings=[rel_type_embedding], ids=[rel_uri])
-
-                    source_id = self.__remove_non_alphanumerical(rel.source.id)
-                    source_uri = EX[f"Entity_{source_id}"]
-                    rdf_graph.add((rel_uri, ONTO.hasSource, source_uri))
-                    rdf_graph.add((source_uri, ONTO.isSourceOf, rel_uri))
-
-                    target_id = self.__remove_non_alphanumerical(rel.target.id)
-                    target_uri = EX[f"Entity_{target_id}"]
-                    rdf_graph.add((rel_uri, ONTO.hasTarget, target_uri))
-                    rdf_graph.add((target_uri, ONTO.isTargetOf, rel_uri))
-
-                    rdf_graph.add((source_uri, ONTO.relatesTarget, target_uri))
-                    rdf_graph.add((target_uri, ONTO.relatesSource, source_uri))
-
-                    # Triples
-                    bnode = BNode()
-                    rdf_graph.add((bnode, RDF.type, ONTO.Triple))
-                    rdf_graph.add((bnode, ONTO.hasSource, source_uri))
-                    rdf_graph.add((bnode, ONTO.hasRelationship, rel_uri))
-                    rdf_graph.add((bnode, ONTO.hasTarget, target_uri))
-                    rdf_graph.add((bnode, ONTO.belongsToChunk, chunk_uri))
-                    collection_triple_embeddings.add(embeddings=[rel_type_triple_embedding], ids=[source_uri+"_"+rel_uri+"_"+target_uri], metadatas=[{"source": source_uri, "rel": rel_uri, "target": target_uri}])
-                    rdf_graph.add((source_uri, ONTO.composes, bnode))
-                    rdf_graph.add((rel_uri, ONTO.composes, bnode))
-                    rdf_graph.add((target_uri, ONTO.composes, bnode))
-
-                    rdf_graph.add((chunk_uri, ONTO.hasRelationship, rel_uri))
-                    rdf_graph.add((doc_uri, ONTO.hasRelationship, rel_uri))
-
-                    rdf_graph.add((rel_uri, ONTO.belongsToChunk, chunk_uri))
-                    rdf_graph.add((rel_uri, ONTO.belongsToDocument, doc_uri))
-
-        # Serialize as Turtle
-        turtle_data = rdf_graph.serialize(format="turtle")
-        # Save to a file
-        export_file = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), "files", f"{file_name}.ttl"
-        )
-        with open(export_file, "w", encoding="utf-8") as f:
-            f.write(turtle_data)
-        print(f"RDF graph has been serialized to '{str(export_file)}'")
-
-
-
-        # Add TRIPLE descriptions using the LLM
-        query = f"""
-            PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-            PREFIX onto: <http://example.org/ontology#>
-            PREFIX ex: <http://example.org/data#>
+                graph.rdf_graph.add((target_entity_type_uri, graph.ONTO.belongsToChunk, chunk_uri))
+                graph.rdf_graph.add((target_entity_type_uri, graph.ONTO.belongsToDocument, doc_uri))
             
-            SELECT ?triple ?prev_chunk_content ?chunk_content ?next_chunk_content ?source_entity ?source_entity_name ?relationship ?relationship_name ?target_entity ?target_entity_name
-            WHERE {{
-                ?triple onto:hasRelationship ?relationship ; rdf:type onto:Triple ; onto:hasSource ?source_entity ; onto:hasTarget ?target_entity ; onto:belongsToChunk ?chunk .
-                ?source_entity onto:hasName ?source_entity_name .
-                ?relationship onto:hasName ?relationship_name .
-                ?target_entity onto:hasName ?target_entity_name .
-                ?chunk onto:hasContent ?chunk_content .
+                # Relationship
+                rel_id = self.__remove_non_alphanumerical(rel.type)
+                rel_uri = graph.EX[f"Relationship_{rel_id}"]
+                graph.rdf_graph.add((rel_uri, RDF.type, graph.ONTO.Relationship))
+                graph.rdf_graph.add((rel_uri, graph.ONTO.hasName, Literal(rel.type, datatype=XSD.string)))
+                
+                graph.rdf_graph.add((rel_uri, graph.ONTO.hasSource, source_entity_uri))
+                graph.rdf_graph.add((source_entity_uri, graph.ONTO.isSourceOf, rel_uri))
 
-                OPTIONAL {{ ?chunk onto:hasNext ?next_chunk . }}
-                OPTIONAL {{ ?next_chunk onto:hasContent ?next_chunk_content . }}
-                OPTIONAL {{ ?chunk onto:hasPrevious ?prev_chunk . }}
-                OPTIONAL {{ ?prev_chunk onto:hasContent ?prev_chunk_content . }}
-            }}
-            GROUP BY ?triple
-        """
-        triples = sparql_query(query, rdf_graph)
+                graph.rdf_graph.add((rel_uri, graph.ONTO.hasTarget, target_entity_uri))
+                graph.rdf_graph.add((target_entity_uri, graph.ONTO.isTargetOf, rel_uri))
 
-        triples["prev_chunk_content"] = triples["prev_chunk_content"].str.replace("\n", " ", regex=False)
-        triples["chunk_content"] = triples["chunk_content"].str.replace("\n", " ", regex=False)
-        triples["next_chunk_content"] = triples["next_chunk_content"].str.replace("\n", " ", regex=False)
+                graph.rdf_graph.add((source_entity_uri, graph.ONTO.relatesTarget, target_entity_uri))
+                graph.rdf_graph.add((target_entity_uri, graph.ONTO.relatesSource, source_entity_uri))
+
+                # Triples
+                bnode = BNode()
+                graph.rdf_graph.add((bnode, RDF.type, graph.ONTO.Triple))
+                graph.rdf_graph.add((bnode, graph.ONTO.hasSource, source_entity_uri))
+                graph.rdf_graph.add((bnode, graph.ONTO.hasRelationship, rel_uri))
+                graph.rdf_graph.add((bnode, graph.ONTO.hasTarget, target_entity_uri))
+                graph.rdf_graph.add((bnode, graph.ONTO.belongsToChunk, chunk_uri))
+                
+                graph.rdf_graph.add((source_entity_uri, graph.ONTO.composes, bnode))
+                graph.rdf_graph.add((rel_uri, graph.ONTO.composes, bnode))
+                graph.rdf_graph.add((target_entity_uri, graph.ONTO.composes, bnode))
+
+                graph.rdf_graph.add((chunk_uri, graph.ONTO.hasRelationship, rel_uri))
+                graph.rdf_graph.add((doc_uri, graph.ONTO.hasRelationship, rel_uri))
+
+                graph.rdf_graph.add((rel_uri, graph.ONTO.belongsToChunk, chunk_uri))
+                graph.rdf_graph.add((rel_uri, graph.ONTO.belongsToDocument, doc_uri))
+
+        #graph.save_to_file(os.path.join(path, f"{file_name}2.ttl")) # Save
+
+        # --- Triple descriptions ---
+
+        if load_cached_triple_descriptions:
+            try:
+                print("Trying to load existing rdf_graph.ttl")
+                graph.load_from_file(os.path.join(path, f"{file_name}.ttl")) # Load
+            except FileNotFoundError:
+                print("No existing knowledge base found.")
+                return
+        else:
+
+            triples = graph.get_triples_and_chunks()
+            
+            triples["prev_chunk_content"] = triples["prev_chunk_content"].str.replace("\n", " ", regex=False)
+            triples["chunk_content"] = triples["chunk_content"].str.replace("\n", " ", regex=False)
+            triples["next_chunk_content"] = triples["next_chunk_content"].str.replace("\n", " ", regex=False)
+
+            for index, row in tqdm(list(triples.iterrows()), desc="Summarizing triples: "):
+                chunk = f"{row["prev_chunk_content"]}\n\n{row["chunk_content"]}\n\n{row["next_chunk_content"]}"
+                description = self._strip_quotes(
+                    self.llm_handler.generate_response(
+                        extract_descriptions_for_triples(f"{chunk}"), f"{row['source_entity_name']} {row["relationship_name"]} {row['target_entity_name']}", False)
+                ).replace("\n\n", "\n")
+                graph.rdf_graph.add((row["triple"], graph.ONTO.hasDescription, Literal(description, datatype=XSD.string)))
+            
+            graph.save_to_file(os.path.join(path, f"{file_name}.ttl")) # Save
+
+
+        # --- Entity descriptions ---
+
+        if load_cached_entity_descriptions:
+            try:
+                print("Trying to load existing rdf_graph.ttl")
+                graph.load_from_file(os.path.join(path, f"{file_name}.ttl")) # Load
+            except FileNotFoundError:
+                print("No existing knowledge base found.")
+                return
+        else:
+
+            # Entities
+            entities = graph.get_entities()
+            for index, row in tqdm(list(entities.iterrows()), desc="Summarizing entities: "):
+                # Types
+                types = graph.get_types(row["entity"])
+                entity_description_from_triples = '\n'.join(f'{row["name"]} is {type["name"]}.' for _, type in types.iterrows())
+                # Descriptions
+                entity_description_from_triples += "\n".join(graph.get_entity_triples(row["entity"])["description"])
+
+                description = self._strip_quotes(
+                    self.llm_handler.generate_response(
+                        extract_descriptions_for_entities(f"{entity_description_from_triples}"), f"{row["name"]}", False)
+                ).replace("\n\n", "\n")
+                graph.rdf_graph.add((row["entity"], graph.ONTO.hasDescription, Literal(description, datatype=XSD.string)))
+
+            graph.save_to_file(os.path.join(path, f"{file_name}.ttl")) # Save
         
-        for index, row in triples.iterrows():
-            chunk = self.__merge_three_overlapping_strings(row["prev_chunk_content"], row["chunk_content"], row["next_chunk_content"])
-            description = self.llm_handler.generate_response(extract_descriptions_for_triples(f"{chunk}"), f"{row['source_entity_name']} {row["relationship_name"]} {row['target_entity_name']}", False)
-            rdf_graph.add((row["triple"], ONTO.hasDescription, Literal(description, datatype=XSD.string)))
+        
+        # --- Embeddings ---
 
-        # Serialize as Turtle
-        turtle_data = rdf_graph.serialize(format="turtle")
-        # Save to a file
-        export_file = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), "files", f"{file_name}.ttl"
+        client = chromadb.PersistentClient(
+            path=os.path.join(path, "chroma_db"),
+            settings=Settings(anonymized_telemetry=False),
         )
-        with open(export_file, "w", encoding="utf-8") as f:
-            f.write(turtle_data)
-        print(f"RDF graph has been serialized to '{str(export_file)}'")
+        collection_entities = client.get_or_create_collection(name="graph_entities", metadata={"hnsw:space":"cosine", "distance_function": "cosine"})
+        collection_types = client.get_or_create_collection(name="graph_types", metadata={"hnsw:space":"cosine", "distance_function": "cosine"})
+        collection_chunks = client.get_or_create_collection(name="graph_chunks", metadata={"hnsw:space":"cosine", "distance_function": "cosine"})
+        collection_relationships = client.get_or_create_collection(name="graph_relationships", metadata={"hnsw:space":"cosine", "distance_function": "cosine"})
+        collection_triples = client.get_or_create_collection(name="graph_triples", metadata={"hnsw:space":"cosine", "distance_function": "cosine"})
+
+        if not load_cached_embeddings:
+
+            # Entities
+            #collection_entities.delete(ids=collection_entities.get()["ids"])
+            entities = graph.get_entities()
+            for index, row in tqdm(list(entities.iterrows()), desc="Embedding entities: "):
+                emb = self.embeddings.embed_query(row["name"])
+                collection_entities.add(ids=[row["entity"]], embeddings=[emb])
+
+            # Types
+            #collection_types.delete(ids=collection_types.get()["ids"])
+            types = graph.get_types()
+            for index, row in tqdm(list(types.iterrows()), desc="Embedding types: "):
+                emb = self.embeddings.embed_query(row["name"])
+                collection_types.add(ids=[row["type"]], embeddings=[emb])
+
+            # Relationships
+            #collection_relationships.delete(ids=collection_relationships.get()["ids"])
+            relationships = graph.get_relationships()
+            for index, row in tqdm(list(relationships.iterrows()), desc="Embedding relationships: "):
+                emb = self.embeddings.embed_query(row["name"])
+                collection_relationships.add(ids=[row["relationship"]], embeddings=[emb])
+
+            # Triples
+            #collection_triples.delete(ids=collection_triples.get()["ids"])
+            triples = graph.get_triples()
+            for index, row in tqdm(list(triples.iterrows()), desc="Embedding triples: "):
+                emb = self.embeddings.embed_query(row["description"])
+                collection_triples.add(ids=[row["triple"]], embeddings=[emb])
+
+            # Chunks
+            #collection_chunks.delete(ids=collection_chunks.get()["ids"])
+            """ chunks = graph.get_chunks()
+            for index, row in tqdm(list(chunks.iterrows()), desc="Embedding chunks: "):
+                emb = self.embeddings.embed_query(row["content"])
+                collection_chunks.add(ids=[row["chunk"]], embeddings=[emb]) """
+
 
         return
+
+
 
         # Add ENTITY descriptions using the LLM
         query = """
@@ -939,7 +701,7 @@ class KnowledgeExtractor:
         turtle_data = rdf_graph.serialize(format="turtle")
         # Save to a file
         export_file = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), "files", f"{file_name}.ttl"
+            os.path.dirname(os.path.realpath(__file__)), path, f"{file_name}.ttl"
         )
         with open(export_file, "w", encoding="utf-8") as f:
             f.write(turtle_data)
