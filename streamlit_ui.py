@@ -24,7 +24,7 @@ st.sidebar.title("Model Parameters")
 provider = st.sidebar.selectbox("Provider", ["openai", "ollama"], index=1)
 
 if provider == "ollama":
-    model = st.sidebar.selectbox("Model", ["gpt-oss", "llama3.2", "mistral"], index=0)
+    model = st.sidebar.selectbox("Model", ["gpt-oss:120b", "gpt-oss:20b", "llama3.2", "mistral"], index=0)
     embedding = st.sidebar.selectbox(
         "Embedding", ["mxbai-embed-large", "nomic-embed-text"], index=0
     )
@@ -43,9 +43,9 @@ language = st.sidebar.selectbox(
 temperature = st.sidebar.slider(
     "Temperature", min_value=0.0, max_value=1.0, value=0.75, step=0.1
 )
-#region = st.sidebar.selectbox(
-#    "User country", ["Italy", "Switzerland", "Other"], index=0
-#)
+region = st.sidebar.selectbox(
+    "User region", ["Italy", "Switzerland", "Europe"], index=0
+)
 user_type = st.sidebar.selectbox(
     "Socioeconomic status", ["Low income", "Medium income", "High income"], index=0
 )
@@ -66,7 +66,7 @@ orchestrator = LiveOrchestrator(
     temperature=temperature,
     user_type=user_type,
     house_type=house_type,
-    region="Italy", #region,
+    region=region,
     use_knowledge=use_knowledge_base,
 )
 
