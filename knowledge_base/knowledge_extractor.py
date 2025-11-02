@@ -19,6 +19,11 @@ from tqdm import tqdm
 import chromadb
 from chromadb.config import Settings
 
+import io
+import requests
+from pdfminer.high_level import extract_text_to_fp
+from pdfminer.layout import LAParams
+
 from llm import LLMHandler
 
 from .utils.graph_prompt import entities_comparator, extract_descriptions_for_entities, extract_descriptions_for_triples, representative_entity_selector, translate_chunk, summarize_chunk
@@ -131,6 +136,36 @@ class KnowledgeExtractor:
                 )
 
         return soup.get_text(separator='\n', strip=True)
+    
+
+    def __extract_font_size(self, style):
+        match = re.search(r'font-size:(\d+)px', style)
+        return int(match.group(1)) if match else None
+    
+    def __convert_spans_to_headings(self, html_content):
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        # Parse and convert spans to headings
+        for span in soup.find_all("span"):
+            style = span.get("style", "")
+            font_size = self.__extract_font_size(style)
+            if font_size is not None:
+                if font_size >= 26:
+                    tag = "h1"
+                elif 22 <= font_size < 26:
+                    tag = "h2"
+                elif 18 <= font_size < 22:
+                    tag = "h3"
+                else:
+                    continue
+                new_tag = soup.new_tag(tag)
+                new_tag.string = span.get_text()
+                span.replace_with(new_tag)
+            else:
+                continue
+
+        # Final HTML with semantic headings
+        return str(soup)
 
     # Run the extraction
     def run(
@@ -138,7 +173,7 @@ class KnowledgeExtractor:
         file_name: str,
         folder: str = "files",
         html_links: list[str] = None,
-        load_cached_docs: bool = True,
+        load_cached_docs: bool = False,
         load_cached_preprocessed_chunks: bool = False,
         load_cached_graph_documents: bool = False,
         load_cached_triple_descriptions: bool = False,
@@ -176,10 +211,63 @@ class KnowledgeExtractor:
                 print("No existing knowledge base found.")
                 return
         else:
-            html_loader = AsyncHtmlLoader(html_links)
-            raw_docs = html_loader.load()
+            # Separate HTML and PDF links
+            html_urls = []
+            pdf_urls = []
+
+            for url in html_links:
+                if url.lower().endswith('.pdf'):
+                    pdf_urls.append(url)
+                else:
+                    html_urls.append(url)
+
+            raw_docs = []
+
+            # Load HTML documents
+            if html_urls:
+                html_loader = AsyncHtmlLoader(html_urls)
+                raw_docs.extend(html_loader.load())
+
+            # Load PDF documents and convert to HTML
+            for pdf_url in pdf_urls:
+                try:
+                    # Download PDF from URL
+                    response = requests.get(pdf_url, timeout=30)
+                    response.raise_for_status()
+
+                    # Extract text with layout preservation as HTML
+                    output_string = io.StringIO()
+                    pdf_file = io.BytesIO(response.content)
+
+                    extract_text_to_fp(
+                        pdf_file, 
+                        output_string, 
+                        laparams=LAParams(),
+                        output_type='html',  # Get HTML output
+                        codec=None
+                    )
+
+                    # Get the HTML content
+                    html_content = output_string.getvalue()
+
+                    # Parse and convert spans to headings
+                    html_content = self.__convert_spans_to_headings(html_content)
+
+                    # Create a Document object similar to HTML loader output
+                    pdf_document = Document(
+                        page_content=html_content,
+                        metadata={
+                            "source": pdf_url,
+                        }
+                    )
+                    raw_docs.append(pdf_document)
+
+                except Exception as e:
+                    print(f"Error loading PDF from {pdf_url}: {e}")
+                    continue
 
             joblib.dump(raw_docs, os.path.join(path, "raw_docs.joblib")) # Save
+
 
         # --- Process documents ---
 
@@ -256,6 +344,9 @@ class KnowledgeExtractor:
             
             for i in tqdm(range(len(preprocessed_chunks)), desc="Translation & summarization of the chunks: "):
 
+                if "language" not in preprocessed_chunks[i].metadata.keys():
+                    preprocessed_chunks[i].metadata["language"] = "na"
+                    
                 # Translation
                 if "en" not in preprocessed_chunks[i].metadata["language"].lower():
                     preprocessed_chunks[i].page_content = self._strip_quotes(
@@ -502,6 +593,7 @@ class KnowledgeExtractor:
         #graph.save_to_file(os.path.join(path, f"{file_name}2.ttl")) # Save
 
         # --- Triple descriptions ---
+        # Triple Context Restoration (TCR) and Query-Driven Feedback (QF)
 
         if load_cached_triple_descriptions:
             try:
