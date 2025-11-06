@@ -44,7 +44,7 @@ temperature = st.sidebar.slider(
     "Temperature", min_value=0.0, max_value=1.0, value=0.75, step=0.1
 )
 region = st.sidebar.selectbox(
-    "User region", ["Italy", "Switzerland", "Europe"], index=0
+    "User region", ["Italy", "Switzerland", "Europe", "Generic"], index=0
 )
 user_type = st.sidebar.selectbox(
     "Socioeconomic status", ["Low income", "Medium income", "High income"], index=0
