@@ -124,6 +124,7 @@ class KnowledgeManager:
 
         #print(f"\n\n-----User message-----\n{message}")
 
+        # If the question is not well-formed
         if len(message) < 3:
             return wrong_answer_prompt(self.language)
 
